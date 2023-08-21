@@ -65,6 +65,7 @@ func NewEtcdRegistry(endpoints []string, opts ...Option) (registry.Registry, err
 	return &etcdRegistry{
 		etcdClient: etcdClient,
 		leaseTTL:   getTTL(),
+		stop:       make(chan struct{}, 1),
 	}, nil
 }
 
@@ -82,6 +83,7 @@ func NewEtcdRegistryWithAuth(endpoints []string, username, password string) (reg
 	return &etcdRegistry{
 		etcdClient: etcdClient,
 		leaseTTL:   getTTL(),
+		stop:       make(chan struct{}, 1),
 	}, nil
 }
 
@@ -145,14 +147,17 @@ func (e *etcdRegistry) register(info *registry.Info, leaseID clientv3.LeaseID) e
 	go func() {
 		// 由于现有的 option 基于 *clientv3.Config, 通过 option 控制将是 breaking change.
 		// 通用的做法都会对 package 有较大的更改, 所以暂时通过 fork 的方式支持.
-		e.keepRegister(serviceKey(info.ServiceName, addr), string(val), 30*time.Second)
+		e.keepRegister(serviceKey(info.ServiceName, addr), string(val), 30*time.Second, 0)
 	}()
 
 	return nil
 }
 
-func (e *etcdRegistry) keepRegister(key, val string, deplay time.Duration) {
-	for {
+// keepRegister keep service registered status
+// maxRetry == 0 means retry forever
+func (e *etcdRegistry) keepRegister(key, val string, deplay time.Duration, maxRetry int64) {
+	var failedTimes int64
+	for maxRetry == 0 || failedTimes < maxRetry {
 		select {
 		case <-e.stop:
 			klog.Infof("stop keep register service %s", key)
@@ -160,30 +165,34 @@ func (e *etcdRegistry) keepRegister(key, val string, deplay time.Duration) {
 		case <-time.After(deplay):
 		}
 
-		resp, err := e.etcdClient.Get(context.Background(), key)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+		defer cancel()
+		resp, err := e.etcdClient.Get(ctx, key)
 		if err != nil {
-			klog.Errorf("keep register get %s failed with err: %v", key, err)
-			e.stop <- struct{}{}
-			return
+			klog.Warnf("keep register get %s failed with err: %v", key, err)
+			failedTimes++
+			continue
 		}
 
 		if len(resp.Kvs) == 0 {
 			klog.Infof("keep register service %s", key)
 			leaseID, err := e.grantLease()
 			if err != nil {
-				klog.Errorf("keep register grant lease %s failed with err: %v", key, err)
-				e.stop <- struct{}{}
-				return
+				klog.Warnf("keep register grant lease %s failed with err: %v", key, err)
+				failedTimes++
+				continue
 			}
 
-			_, err = e.etcdClient.Put(context.Background(), key, val, clientv3.WithLease(leaseID))
+			_, err = e.etcdClient.Put(ctx, key, val, clientv3.WithLease(leaseID))
 			if err != nil {
-				klog.Errorf("keep register put %s failed with err: %v", key, err)
-				e.stop <- struct{}{}
-				return
+				klog.Warnf("keep register put %s failed with err: %v", key, err)
+				failedTimes++
+				continue
 			}
 		}
+		failedTimes = 0
 	}
+	klog.Errorf("keep register service %s failed times:%d", key, failedTimes)
 }
 
 func (e *etcdRegistry) deregister(info *registry.Info) error {
@@ -198,6 +207,7 @@ func (e *etcdRegistry) deregister(info *registry.Info) error {
 		return err
 	}
 	e.stop <- struct{}{}
+	close(e.stop)
 	return nil
 }
 

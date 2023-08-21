@@ -1,4 +1,4 @@
-module github.com/a631807682/registry-etcd
+module github.com/a631807682/registry-etcd-retry
 
 go 1.15
 

@@ -41,6 +41,7 @@ type etcdRegistry struct {
 	etcdClient *clientv3.Client
 	leaseTTL   int64
 	meta       *registerMeta
+	stop       chan struct{}
 }
 
 type registerMeta struct {
@@ -137,7 +138,52 @@ func (e *etcdRegistry) register(info *registry.Info, leaseID clientv3.LeaseID) e
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
 	defer cancel()
 	_, err = e.etcdClient.Put(ctx, serviceKey(info.ServiceName, addr), string(val), clientv3.WithLease(leaseID))
-	return err
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		// 由于现有的 option 基于 *clientv3.Config, 通过 option 控制将是 breaking change.
+		// 通用的做法都会对 package 有较大的更改, 所以暂时通过 fork 的方式支持.
+		e.keepRegister(serviceKey(info.ServiceName, addr), string(val), 30*time.Second)
+	}()
+
+	return nil
+}
+
+func (e *etcdRegistry) keepRegister(key, val string, deplay time.Duration) {
+	for {
+		select {
+		case <-e.stop:
+			klog.Infof("stop keep register service %s", key)
+			return
+		case <-time.After(deplay):
+		}
+
+		resp, err := e.etcdClient.Get(context.Background(), key)
+		if err != nil {
+			klog.Errorf("keep register get %s failed with err: %v", key, err)
+			e.stop <- struct{}{}
+			return
+		}
+
+		if len(resp.Kvs) == 0 {
+			klog.Infof("keep register service %s", key)
+			leaseID, err := e.grantLease()
+			if err != nil {
+				klog.Errorf("keep register grant lease %s failed with err: %v", key, err)
+				e.stop <- struct{}{}
+				return
+			}
+
+			_, err = e.etcdClient.Put(context.Background(), key, val, clientv3.WithLease(leaseID))
+			if err != nil {
+				klog.Errorf("keep register put %s failed with err: %v", key, err)
+				e.stop <- struct{}{}
+				return
+			}
+		}
+	}
 }
 
 func (e *etcdRegistry) deregister(info *registry.Info) error {
@@ -148,7 +194,11 @@ func (e *etcdRegistry) deregister(info *registry.Info) error {
 		return err
 	}
 	_, err = e.etcdClient.Delete(ctx, serviceKey(info.ServiceName, addr))
-	return err
+	if err != nil {
+		return err
+	}
+	e.stop <- struct{}{}
+	return nil
 }
 
 func (e *etcdRegistry) grantLease() (clientv3.LeaseID, error) {

@@ -1,4 +1,4 @@
-module github.com/kitex-contrib/registry-etcd
+module github.com/a631807682/registry-etcd
 
 go 1.15
 

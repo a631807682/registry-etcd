@@ -144,11 +144,11 @@ func (e *etcdRegistry) register(info *registry.Info, leaseID clientv3.LeaseID) e
 		return err
 	}
 
-	go func() {
+	go func(key, val string) {
 		// 由于现有的 option 基于 *clientv3.Config, 通过 option 控制将是 breaking change.
 		// 通用的做法都会对 package 有较大的更改, 所以暂时通过 fork 的方式支持.
-		e.keepRegister(serviceKey(info.ServiceName, addr), string(val), 30*time.Second, 0)
-	}()
+		e.keepRegister(key, val, 30*time.Second, 0)
+	}(serviceKey(info.ServiceName, addr), string(val))
 
 	return nil
 }
@@ -159,7 +159,10 @@ func (e *etcdRegistry) keepRegister(key, val string, deplay time.Duration, maxRe
 	var failedTimes int64
 	for maxRetry == 0 || failedTimes < maxRetry {
 		select {
-		case <-e.stop:
+		case _, ok := <-e.stop:
+			if !ok {
+				close(e.stop)
+			}
 			klog.Infof("stop keep register service %s", key)
 			return
 		case <-time.After(deplay):
@@ -189,6 +192,17 @@ func (e *etcdRegistry) keepRegister(key, val string, deplay time.Duration, maxRe
 				failedTimes++
 				continue
 			}
+
+			meta := registerMeta{
+				leaseID: leaseID,
+			}
+			meta.ctx, meta.cancel = context.WithCancel(context.Background())
+			if err := e.keepalive(&meta); err != nil {
+				klog.Warnf("keep register keepalive %s failed with err: %v", key, err)
+				failedTimes++
+				continue
+			}
+			e.meta = &meta
 		}
 		failedTimes = 0
 	}
@@ -207,7 +221,6 @@ func (e *etcdRegistry) deregister(info *registry.Info) error {
 		return err
 	}
 	e.stop <- struct{}{}
-	close(e.stop)
 	return nil
 }
 
